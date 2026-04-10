@@ -1,0 +1,261 @@
+services:
+  # ─── Infrastructure ─────────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-fw}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fw_secret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-databases.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fw}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-fw}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-fw_secret}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  kong:
+    image: kong:3.7-ubuntu
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /kong/kong.yml
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_LISTEN: "0.0.0.0:8001"
+    volumes:
+      - ./kong/kong.yml:/kong/kong.yml:ro
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+    depends_on:
+      - identity
+      - transaction
+      - journal
+      - insight
+      - notification
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.55
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+
+  # ─── Embedding Service ───────────────────────────────────────────────────
+  embedding:
+    build: ./services/embedding
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s  # BGE-M3 model load takes time
+
+  # ─── Migrations (run once, exit 0) ──────────────────────────────────────
+  identity-migrator:
+    build:
+      context: ./services/identity
+      target: base
+    command: alembic upgrade head
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-fw}:${POSTGRES_PASSWORD:-fw_secret}@postgres:5432/identity_db
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  transaction-migrator:
+    build:
+      context: ./services/transaction
+      target: base
+    command: alembic upgrade head
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-fw}:${POSTGRES_PASSWORD:-fw_secret}@postgres:5432/transaction_db
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  journal-migrator:
+    build:
+      context: ./services/journal
+      target: base
+    command: alembic upgrade head
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-fw}:${POSTGRES_PASSWORD:-fw_secret}@postgres:5432/journal_db
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  insight-migrator:
+    build:
+      context: ./services/insight
+      target: base
+    command: alembic upgrade head
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-fw}:${POSTGRES_PASSWORD:-fw_secret}@postgres:5432/insight_db
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  notification-migrator:
+    build:
+      context: ./services/notification
+      target: base
+    command: alembic upgrade head
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-fw}:${POSTGRES_PASSWORD:-fw_secret}@postgres:5432/notification_db
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ─── Services ────────────────────────────────────────────────────────────
+  identity:
+    build: ./services/identity
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-fw}:${POSTGRES_PASSWORD:-fw_secret}@postgres:5432/identity_db
+      PRIVATE_KEY_PATH: /run/secrets/jwt_private_key
+      PUBLIC_KEY_PATH: /run/secrets/jwt_public_key
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-60}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_SERVICE_NAME: identity-service
+    secrets: [jwt_private_key, jwt_public_key]
+    ports:
+      - "8010:8000"
+    depends_on:
+      identity-migrator:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+
+  transaction:
+    build: ./services/transaction
+    restart: on-failure
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-fw}:${POSTGRES_PASSWORD:-fw_secret}@postgres:5432/transaction_db
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-fw}:${RABBITMQ_PASSWORD:-fw_secret}@rabbitmq:5672/
+      PUBLIC_KEY_PATH: /run/secrets/jwt_public_key
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_SERVICE_NAME: transaction-service
+    secrets: [jwt_public_key]
+    ports:
+      - "8011:8000"
+    depends_on:
+      transaction-migrator:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  journal:
+    build: ./services/journal
+    restart: on-failure
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-fw}:${POSTGRES_PASSWORD:-fw_secret}@postgres:5432/journal_db
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-fw}:${RABBITMQ_PASSWORD:-fw_secret}@rabbitmq:5672/
+      PUBLIC_KEY_PATH: /run/secrets/jwt_public_key
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_SERVICE_NAME: journal-service
+    secrets: [jwt_public_key]
+    ports:
+      - "8012:8000"
+    depends_on:
+      journal-migrator:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  insight:
+    build: ./services/insight
+    restart: on-failure
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-fw}:${POSTGRES_PASSWORD:-fw_secret}@postgres:5432/insight_db
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-fw}:${RABBITMQ_PASSWORD:-fw_secret}@rabbitmq:5672/
+      REDIS_URL: redis://redis:6379/0
+      EMBEDDING_SERVICE_URL: http://embedding:8080
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      RAG_TOP_K: 8
+      RAG_CHUNK_SIZE: 512
+      RAG_CHUNK_OVERLAP: 64
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_SERVICE_NAME: insight-service
+    ports:
+      - "8013:8000"
+    depends_on:
+      insight-migrator:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  notification:
+    build: ./services/notification
+    restart: on-failure
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-fw}:${POSTGRES_PASSWORD:-fw_secret}@postgres:5432/notification_db
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-fw}:${RABBITMQ_PASSWORD:-fw_secret}@rabbitmq:5672/
+      REDIS_URL: redis://redis:6379/0
+      SPENDING_SPIKE_THRESHOLD_VND: ${SPENDING_SPIKE_THRESHOLD_VND:-500000}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_SERVICE_NAME: notification-service
+    ports:
+      - "8014:8000"
+    depends_on:
+      notification-migrator:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+secrets:
+  jwt_private_key:
+    file: ./secrets/jwt_private_key.pem
+  jwt_public_key:
+    file: ./secrets/jwt_public_key.pem
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
+  redis_data:

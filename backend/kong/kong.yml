@@ -1,0 +1,149 @@
+_format_version: "3.0"
+_transform: true
+
+services:
+  - name: identity-service
+    url: http://identity:8000
+    routes:
+      - name: auth-public
+        paths: [/auth/register, /auth/login, /auth/.well-known/jwks.json]
+        strip_path: false
+        methods: [POST, GET]
+
+  - name: transaction-service
+    url: http://transaction:8000
+    plugins:
+      - name: jwt
+        config:
+          key_claim_name: kid
+          claims_to_verify: [exp]
+    routes:
+      - name: transactions
+        paths: [/transactions]
+        strip_path: false
+        methods: [GET, POST, PATCH, DELETE]
+
+  - name: journal-service
+    url: http://journal:8000
+    plugins:
+      - name: jwt
+        config:
+          key_claim_name: kid
+          claims_to_verify: [exp]
+    routes:
+      - name: journal
+        paths: [/journal]
+        strip_path: false
+        methods: [GET, POST, PATCH, DELETE]
+
+  - name: insight-service
+    url: http://insight:8000
+    plugins:
+      - name: jwt
+        config:
+          key_claim_name: kid
+          claims_to_verify: [exp]
+      - name: rate-limiting
+        config:
+          minute: 20       # LLM endpoint — tighter limit
+          policy: local
+    routes:
+      - name: insights
+        paths: [/insights]
+        strip_path: false
+        methods: [GET, POST, PATCH, DELETE]
+      - name: insights-chat
+        paths: [/insights/chat]
+        strip_path: false
+        methods: [POST]
+        plugins:
+          - name: rate-limiting
+            config:
+              minute: 10        # LLM call — tighter limit than general insight reads
+              policy: local
+
+  - name: notification-service
+    url: http://notification:8000
+    plugins:
+      - name: jwt
+        config:
+          key_claim_name: kid
+          claims_to_verify: [exp]
+    routes:
+      - name: notifications
+        paths: [/notifications]
+        strip_path: false
+        methods: [GET, PATCH]
+
+# ── JWT consumer ──────────────────────────────────────────────────────────────
+# One shared consumer for all app-issued tokens.
+# The jwt plugin matches the token's `kid` header claim against credential.key.
+# After a successful match + signature verification, the post-function plugin
+# (below) injects the user UUID from the JWT sub claim as X-Authenticated-Userid.
+consumers:
+  - username: fw-app
+    jwt_secrets:
+      - key: 2907f1e5
+        algorithm: RS256
+        rsa_public_key: |
+          -----BEGIN PUBLIC KEY-----
+          MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvfmk2WTbAwkFIZvX/2pq
+          1XyFJ6+LUg0vbndOyuGYHFt7W2EmkTrFhhqo6Ejo4jF8/eum07JwJiTFmKnCEfwt
+          BnCT413OZvlE2LKBAfnR9jaIjWYPp/MrAk0ZKKWAX4YCDMU84P+iJQlvjIokzCHM
+          Ueq09zMhfee5x5MukX32s4rJxJEz11UjMuynJjC1eXV198XOCECro/bFCeaC2bFM
+          d8wK03KjnQLfqjsgqoVYtx/zfLOfShiz8C95KJyvzbHJH5DNhhIZ+9vtoYZxgpYL
+          pc0EFiH3JFLr1yNe6/3B7Z1tOPNk6YUFY8hgUhL2G5IxLIrj2THqhPTak3j6v0r3
+          eQIDAQAB
+          -----END PUBLIC KEY-----
+
+plugins:
+  # Inject X-Authenticated-Userid from JWT sub claim.
+  # Runs last (post-function priority = -1000), guaranteeing:
+  #   - jwt plugin already validated signature + exp
+  #   - request-transformer already stripped any client-supplied header (anti-spoof)
+  - name: post-function
+    config:
+      access:
+        - |
+          local auth = kong.request.get_header("authorization")
+          if not auth then return end
+          local token = auth:match("^[Bb]earer%s+(.+)$")
+          if not token then return end
+          local parts = {}
+          for p in token:gmatch("[^.]+") do parts[#parts + 1] = p end
+          if #parts ~= 3 then return end
+          local b64 = parts[2]:gsub("%-", "+"):gsub("_", "/")
+          local pad = #b64 % 4
+          if pad > 0 then b64 = b64 .. string.rep("=", 4 - pad) end
+          local decoded = ngx.decode_base64(b64)
+          if not decoded then return end
+          -- Extract sub claim with pattern (avoids sandbox cjson restriction)
+          local sub = decoded:match('"sub"%s*:%s*"([^"]+)"')
+          if sub and sub ~= "" then
+            kong.service.request.set_header("X-Authenticated-Userid", sub)
+          end
+
+  - name: request-transformer
+    config:
+      remove:
+        headers: [X-Consumer-ID, X-Consumer-Username, X-Authenticated-Userid]
+
+  - name: rate-limiting
+    config:
+      minute: 120
+      policy: local
+
+  - name: cors
+    config:
+      origins: ["http://localhost:3000"]
+      methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+      headers: [Authorization, Content-Type]
+      max_age: 3600
+
+  - name: opentelemetry
+    config:
+      endpoint: http://jaeger:4318/v1/traces
+      resource_attributes:
+        service.name: kong-gateway
+      propagation:
+        default_format: w3c
